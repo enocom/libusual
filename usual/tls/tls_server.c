@@ -171,6 +171,13 @@ tls_accept_fds(struct tls *ctx, struct tls **cctx, int fd_read, int fd_write)
 	return (-1);
 }
 
+static int	alpn_cb(SSL *ssl,
+					const unsigned char **out,
+					unsigned char *outlen,
+					const unsigned char *in,
+					unsigned int inlen,
+					void *userdata);
+
 int
 tls_handshake_server(struct tls *ctx)
 {
@@ -182,17 +189,81 @@ tls_handshake_server(struct tls *ctx)
 		goto err;
 	}
 
+	SSL_CTX_set_alpn_select_cb(ctx->ssl_ctx, alpn_cb, 0);
+
 	ERR_clear_error();
 	if ((ssl_ret = SSL_accept(ctx->ssl_conn)) != 1) {
 		rv = tls_ssl_error(ctx, ctx->ssl_conn, ssl_ret, "handshake");
 		goto err;
 	}
 
+	// TODO verify ALPN is the one we want
+
 	ctx->state |= TLS_HANDSHAKE_COMPLETE;
 	rv = 0;
 
  err:
 	return (rv);
+}
+
+/* Application-Layer Protocol Negotiation is required for direct connections
+ * to avoid protocol confusion attacks (e.g https://alpaca-attack.com/).
+ *
+ * ALPN is specified in RFC 7301
+ *
+ * This string should be registered at:
+ * https://www.iana.org/assignments/tls-extensiontype-values/tls-extensiontype-values.xhtml#alpn-protocol-ids
+ *
+ * OpenSSL uses this wire-format for the list of alpn protocols even in the
+ * API. Both server and client take the same format parameter but the client
+ * actually sends it to the server as-is and the server it specifies the
+ * preference order to use to choose the one selected to send back.
+ *
+ * c.f. https://www.openssl.org/docs/manmaster/man3/SSL_CTX_set_alpn_select_cb.html
+ *
+ * The #define can be used to initialize a char[] vector to use directly in the API
+ */
+#define PG_ALPN_PROTOCOL "postgresql"
+#define PG_ALPN_PROTOCOL_VECTOR { 10, 'p','o','s','t','g','r','e','s','q','l' }
+/* See pqcomm.h comments on OpenSSL implementation of ALPN (RFC 7301) */
+static const unsigned char alpn_protos[] = PG_ALPN_PROTOCOL_VECTOR;
+
+/*
+ * Server callback for ALPN negotiation. We use the standard "helper" function
+ * even though currently we only accept one value.
+ */
+static int
+alpn_cb(SSL *ssl,
+		const unsigned char **out,
+		unsigned char *outlen,
+		const unsigned char *in,
+		unsigned int inlen,
+		void *userdata)
+{
+	/*
+	 * Why does OpenSSL provide a helper function that requires a nonconst
+	 * vector when the callback is declared to take a const vector? What are
+	 * we to do with that?
+	 */
+	int			retval;
+
+
+	Assert(userdata != NULL);
+	Assert(out != NULL);
+	Assert(outlen != NULL);
+	Assert(in != NULL);
+
+	retval = SSL_select_next_proto((unsigned char **) out, outlen,
+								   alpn_protos, sizeof(alpn_protos),
+								   in, inlen);
+	if (*out == NULL || *outlen > sizeof(alpn_protos) || outlen <= 0)
+		return SSL_TLSEXT_ERR_NOACK;	/* can't happen */
+	if (retval == OPENSSL_NPN_NEGOTIATED)
+		return SSL_TLSEXT_ERR_OK;
+	else if (retval == OPENSSL_NPN_NO_OVERLAP)
+		return SSL_TLSEXT_ERR_NOACK;
+	else
+		return SSL_TLSEXT_ERR_NOACK;
 }
 
 #endif /* USUAL_LIBSSL_FOR_TLS */
